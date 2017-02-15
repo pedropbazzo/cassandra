@@ -21,7 +21,7 @@ package org.apache.cassandra.metrics;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
-import java.nio.charset.StandardCharsets;
+import java.nio.charset.Charset;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLongArray;
@@ -48,7 +48,7 @@ import org.apache.cassandra.utils.EstimatedHistogram;
  * end of the 30:th minute all collected values will roughly add up to 1.000.000 * 60 * pow(2, 30) which can be
  * represented with 56 bits giving us some head room in a signed 64 bit long.
  *
- * Internally two reservoirs are maintained, one with decay and one without decay. All public getters in a {@link Snapshot}
+ * Internally two reservoirs are maintained, one with decay and one without decay. All public getters in a {@Snapshot}
  * will expose the decay functionality with the exception of the {@link Snapshot#getValues()} which will return values
  * from the reservoir without decay. This makes it possible for the caller to maintain precise deltas in an interval of
  * its choise.
@@ -69,6 +69,11 @@ import org.apache.cassandra.utils.EstimatedHistogram;
  */
 public class DecayingEstimatedHistogramReservoir implements Reservoir
 {
+
+    static {
+        System.err.println("Using the RC fork of DecayingEstimatedHistogramReservoir, please deliver PR to Cassandra ASAP!!!");
+    }
+
     /**
      * The default number of decayingBuckets. Use this bucket count to reduce memory allocation for bucket offsets.
      */
@@ -190,7 +195,7 @@ public class DecayingEstimatedHistogramReservoir implements Reservoir
 
     private double forwardDecayWeight(long now)
     {
-        return Math.exp(((now - decayLandmark) / 1000.0) / MEAN_LIFETIME_IN_S);
+        return Math.exp(((now - decayLandmark) / 1000L) / MEAN_LIFETIME_IN_S);
     }
 
     /**
@@ -331,6 +336,9 @@ public class DecayingEstimatedHistogramReservoir implements Reservoir
         this.lock.writeLock().unlock();
     }
 
+
+    private static final Charset UTF_8 = Charset.forName("UTF-8");
+
     /**
      * Represents a snapshot of the decaying histogram.
      *
@@ -348,12 +356,11 @@ public class DecayingEstimatedHistogramReservoir implements Reservoir
         public EstimatedHistogramReservoirSnapshot(DecayingEstimatedHistogramReservoir reservoir)
         {
             final int length = reservoir.decayingBuckets.length();
-            final double rescaleFactor = forwardDecayWeight(clock.getTime());
 
             this.decayingBuckets = new long[length];
 
             for (int i = 0; i < length; i++)
-                this.decayingBuckets[i] = Math.round(reservoir.decayingBuckets.get(i) / rescaleFactor);
+                this.decayingBuckets[i] = reservoir.decayingBuckets.get(i);
         }
 
         /**
@@ -367,21 +374,16 @@ public class DecayingEstimatedHistogramReservoir implements Reservoir
         {
             assert quantile >= 0 && quantile <= 1.0;
 
-            final int lastBucket = decayingBuckets.length - 1;
-
-            if (decayingBuckets[lastBucket] > 0)
-                throw new IllegalStateException("Unable to compute when histogram overflowed");
-
             final long qcount = (long) Math.ceil(count() * quantile);
             if (qcount == 0)
                 return 0;
 
             long elements = 0;
-            for (int i = 0; i < lastBucket; i++)
+            for (int i = 0; i < decayingBuckets.length; i++)
             {
                 elements += decayingBuckets[i];
                 if (elements >= qcount)
-                    return bucketOffsets[i];
+                    return getBucketOffset(i);
             }
             return 0;
         }
@@ -445,12 +447,12 @@ public class DecayingEstimatedHistogramReservoir implements Reservoir
             final int lastBucket = decayingBuckets.length - 1;
 
             if (decayingBuckets[lastBucket] > 0)
-                return Long.MAX_VALUE;
+                return getBucketOffset(lastBucket);
 
             for (int i = lastBucket - 1; i >= 0; i--)
             {
                 if (decayingBuckets[i] > 0)
-                    return bucketOffsets[i];
+                    return getBucketOffset(i);
             }
             return 0;
         }
@@ -463,18 +465,13 @@ public class DecayingEstimatedHistogramReservoir implements Reservoir
          */
         public double getMean()
         {
-            final int lastBucket = decayingBuckets.length - 1;
-
-            if (decayingBuckets[lastBucket] > 0)
-                throw new IllegalStateException("Unable to compute when histogram overflowed");
-
             long elements = 0;
             long sum = 0;
-            for (int i = 0; i < lastBucket; i++)
+            for (int i = 0; i < decayingBuckets.length; i++)
             {
                 long bCount = decayingBuckets[i];
                 elements += bCount;
-                sum += bCount * bucketOffsets[i];
+                sum += bCount * getBucketOffset(i);
             }
 
             return (double) sum / elements;
@@ -493,7 +490,7 @@ public class DecayingEstimatedHistogramReservoir implements Reservoir
             for (int i = 0; i < decayingBuckets.length; i++)
             {
                 if (decayingBuckets[i] > 0)
-                    return i == 0 ? 0 : 1 + bucketOffsets[i - 1];
+                    return i == 0 ? 0 : 1 + getBucketOffset(i - 1);
             }
             return 0;
         }
@@ -508,11 +505,6 @@ public class DecayingEstimatedHistogramReservoir implements Reservoir
          */
         public double getStdDev()
         {
-            final int lastBucket = decayingBuckets.length - 1;
-
-            if (decayingBuckets[lastBucket] > 0)
-                throw new IllegalStateException("Unable to compute when histogram overflowed");
-
             final long count = count();
 
             if(count <= 1)
@@ -524,9 +516,9 @@ public class DecayingEstimatedHistogramReservoir implements Reservoir
                 double mean = this.getMean();
                 double sum = 0.0D;
 
-                for(int i = 0; i < lastBucket; ++i)
+                for(int i = 0; i < decayingBuckets.length; ++i)
                 {
-                    long value = bucketOffsets[i];
+                    long value = getBucketOffset(i);
                     double diff = value - mean;
                     sum += diff * diff * decayingBuckets[i];
                 }
@@ -537,7 +529,7 @@ public class DecayingEstimatedHistogramReservoir implements Reservoir
 
         public void dump(OutputStream output)
         {
-            try (PrintWriter out = new PrintWriter(new OutputStreamWriter(output, StandardCharsets.UTF_8)))
+            try (PrintWriter out = new PrintWriter(new OutputStreamWriter(output, UTF_8)))
             {
                 int length = decayingBuckets.length;
 
@@ -547,5 +539,9 @@ public class DecayingEstimatedHistogramReservoir implements Reservoir
                 }
             }
         }
+    }
+
+    private long getBucketOffset(int i) {
+        return i == bucketOffsets.length?  bucketOffsets[i - 1]: bucketOffsets[i];
     }
 }
